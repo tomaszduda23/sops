@@ -18,6 +18,7 @@ import (
 	"golang.org/x/term"
 
 	"github.com/getsops/sops/v3/logging"
+	gpgagent "github.com/tomaszduda23/gopgagent"
 )
 
 const (
@@ -307,34 +308,75 @@ func (key *MasterKey) loadIdentities() (ParsedIdentities, error) {
 			if len(contents) == privateKeySizeLimit {
 				return nil, fmt.Errorf("failed to read '%s': file too long", n)
 			}
+			IncorrectPassphrase := func() {
+				conn, err := gpgagent.NewConn()
+				if err != nil {
+					return
+				}
+				defer func(conn *gpgagent.Conn) {
+					if err := conn.Close(); err != nil {
+						log.Errorf("failed to close connection with gpg-agent: %s", err)
+					}
+				}(conn)
+				err = conn.RemoveFromCache(n)
+				if err != nil {
+					log.Warnf("gpg-agent remove cache request errored: %s", err)
+					return
+				}
+			}
 			ids := []age.Identity{&EncryptedIdentity{
 				Contents: contents,
 				Passphrase: func() (string, error) {
-					fmt.Fprintf(os.Stderr, "Enter passphrase for identity '%s':", n)
-
-					var pass string
-					if term.IsTerminal(syscall.Stdin) {
-						p, err = term.ReadPassword(syscall.Stdin)
-						if err == nil {
-							pass = string(p)
-						}
-					} else {
-						reader := bufio.NewReader(os.Stdin)
-						pass, err = reader.ReadString('\n')
-						if err == io.EOF {
-							err = nil
-						}
-					}
+					conn, err := gpgagent.NewConn()
 					if err != nil {
-						return "", fmt.Errorf("could not read passphrase: %v", err)
+						fmt.Fprintf(os.Stderr, "Enter passphrase for identity '%s':", n)
+
+						var pass string
+						if term.IsTerminal(syscall.Stdin) {
+							p, err = term.ReadPassword(syscall.Stdin)
+							if err == nil {
+								pass = string(p)
+							}
+						} else {
+							reader := bufio.NewReader(os.Stdin)
+							pass, err = reader.ReadString('\n')
+							if err == io.EOF {
+								err = nil
+							}
+						}
+						if err != nil {
+							return "", fmt.Errorf("could not read passphrase: %v", err)
+						}
+
+						fmt.Fprintln(os.Stderr)
+
+						return pass, nil
 					}
+					defer func(conn *gpgagent.Conn) {
+						if err := conn.Close(); err != nil {
+							log.Errorf("failed to close connection with gpg-agent: %s", err)
+						}
+					}(conn)
 
-					fmt.Fprintln(os.Stderr)
-
+					req := gpgagent.PassphraseRequest{
+						// TODO is the cachekey good enough?
+						CacheKey: n,
+						Prompt:   "Passphrase",
+						Desc:     fmt.Sprintf("Enter passphrase for identity '%s':", n),
+					}
+					pass, err := conn.GetPassphrase(&req)
+					if err != nil {
+						return "", fmt.Errorf("gpg-agent passphrase request errored: %s", err)
+					}
+					//make sure that we won't store empty pass
+					if len(pass) == 0 {
+						IncorrectPassphrase()
+					}
 					return pass, nil
 				},
+				IncorrectPassphrase: IncorrectPassphrase,
 				NoMatchWarning: func() {
-					warningf("encrypted identity '%s' didn't match file's recipients", n)
+					log.Warnf("encrypted identity '%s' didn't match file's recipients", n)
 				},
 			}}
 			identities = append(identities, ids...)
@@ -375,9 +417,10 @@ func parseIdentities(identity ...string) (ParsedIdentities, error) {
 }
 
 type EncryptedIdentity struct {
-	Contents       []byte
-	Passphrase     func() (string, error)
-	NoMatchWarning func()
+	Contents            []byte
+	Passphrase          func() (string, error)
+	NoMatchWarning      func()
+	IncorrectPassphrase func()
 
 	identities []age.Identity
 }
@@ -408,7 +451,13 @@ func (i *EncryptedIdentity) Unwrap(stanzas []*age.Stanza) (fileKey []byte, err e
 func (i *EncryptedIdentity) decrypt() error {
 	d, err := age.Decrypt(bytes.NewReader(i.Contents), &LazyScryptIdentity{i.Passphrase})
 	if e := new(age.NoIdentityMatchError); errors.As(err, &e) {
-		return fmt.Errorf("identity file is encrypted with age but not with a passphrase")
+		// ScryptIdentity returns ErrIncorrectIdentity for an incorrect
+		// passphrase, which would lead Decrypt to returning "no identity
+		// matched any recipient". That makes sense in the API, where there
+		// might be multiple configured ScryptIdentity. Since in cmd/age there
+		// can be only one, return a better error message.
+		i.IncorrectPassphrase()
+		return fmt.Errorf("incorrect passphrase")
 	}
 	if err != nil {
 		return fmt.Errorf("failed to decrypt identity file: %v", err)
@@ -444,17 +493,5 @@ func (i *LazyScryptIdentity) Unwrap(stanzas []*age.Stanza) (fileKey []byte, err 
 		return nil, err
 	}
 	fileKey, err = ii.Unwrap(stanzas)
-	if errors.Is(err, age.ErrIncorrectIdentity) {
-		// ScryptIdentity returns ErrIncorrectIdentity for an incorrect
-		// passphrase, which would lead Decrypt to returning "no identity
-		// matched any recipient". That makes sense in the API, where there
-		// might be multiple configured ScryptIdentity. Since in cmd/age there
-		// can be only one, return a better error message.
-		return nil, fmt.Errorf("incorrect passphrase")
-	}
 	return fileKey, err
-}
-
-func warningf(format string, v ...interface{}) {
-	log.Warnf("age: warning: "+format, v...)
 }

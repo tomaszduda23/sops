@@ -418,6 +418,8 @@ func TestMasterKey_Identities_Passphrase(t *testing.T) {
 	t.Run(SopsAgeKeyEnv, func(t *testing.T) {
 		key := &MasterKey{EncryptedKey: mockEncryptedKey}
 		t.Setenv(SopsAgeKeyEnv, mockEncryptedIdentity)
+		//blocks calling gpg-agent
+		os.Unsetenv("XDG_RUNTIME_DIR")
 
 		funcDefer, _ := mockStdin(t, mockIdentityPassphrase)
 		defer funcDefer()
@@ -438,6 +440,8 @@ func TestMasterKey_Identities_Passphrase(t *testing.T) {
 
 		key := &MasterKey{EncryptedKey: mockEncryptedKey}
 		t.Setenv(SopsAgeKeyFileEnv, keyPath)
+		//blocks calling gpg-agent
+		os.Unsetenv("XDG_RUNTIME_DIR")
 
 		funcDefer, _ := mockStdin(t, mockIdentityPassphrase)
 		defer funcDefer()
@@ -450,6 +454,8 @@ func TestMasterKey_Identities_Passphrase(t *testing.T) {
 	t.Run("invalid encrypted key", func(t *testing.T) {
 		key := &MasterKey{EncryptedKey: "invalid"}
 		t.Setenv(SopsAgeKeyEnv, mockEncryptedIdentity)
+		//blocks calling gpg-agent
+		os.Unsetenv("XDG_RUNTIME_DIR")
 
 		funcDefer, _ := mockStdin(t, mockIdentityPassphrase)
 		defer funcDefer()
