@@ -33,7 +33,6 @@ require (
 	github.com/pkg/errors v0.9.1
 	github.com/sirupsen/logrus v1.9.3
 	github.com/stretchr/testify v1.8.4
-	github.com/tomaszduda23/gopgagent v0.0.0-20231231125842-0d2facc3788a
 	github.com/urfave/cli v1.22.14
 	golang.org/x/net v0.19.0
 	golang.org/x/sys v0.15.0
