@@ -17,8 +17,8 @@ import (
 	"github.com/sirupsen/logrus"
 	"golang.org/x/term"
 
+	gpgagent "github.com/getsops/gopgagent"
 	"github.com/getsops/sops/v3/logging"
-	gpgagent "github.com/tomaszduda23/gopgagent"
 )
 
 const (
