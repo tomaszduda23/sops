@@ -26,6 +26,7 @@ import (
 	"github.com/getsops/sops/v3/cmd/sops/codes"
 	"github.com/getsops/sops/v3/cmd/sops/common"
 	"github.com/getsops/sops/v3/cmd/sops/subcommand/exec"
+	filestatuscmd "github.com/getsops/sops/v3/cmd/sops/subcommand/filestatus"
 	"github.com/getsops/sops/v3/cmd/sops/subcommand/groups"
 	keyservicecmd "github.com/getsops/sops/v3/cmd/sops/subcommand/keyservice"
 	publishcmd "github.com/getsops/sops/v3/cmd/sops/subcommand/publish"
@@ -128,7 +129,7 @@ func main() {
 
    The -p, -k, --gcp-kms, --hc-vault-transit, and --azure-kv flags are only
    used to encrypt new documents. Editing or decrypting existing documents
-   can be done with "sops file" or "sops -d file" respectively. The KMS and
+   can be done with "sops file" or "sops decrypt file" respectively. The KMS and
    PGP keys listed in the encrypted documents are used then. To manage master
    keys in existing documents, use the "add-{kms,pgp,gcp-kms,azure-kv,hc-vault-transit}"
    and "rm-{kms,pgp,gcp-kms,azure-kv,hc-vault-transit}" flags with --rotate
@@ -170,7 +171,10 @@ func main() {
 				fileName := c.Args()[0]
 				command := c.Args()[1]
 
-				inputStore := inputStore(c, fileName)
+				inputStore, err := inputStore(c, fileName)
+				if err != nil {
+					return toExitError(err)
+				}
 
 				svcs := keyservices(c)
 
@@ -192,17 +196,40 @@ func main() {
 					log.Warn("exec-env's --background option is deprecated and will be removed in a future version of sops")
 				}
 
-				output, err := decrypt(opts)
+				tree, err := decryptTree(opts)
 				if err != nil {
 					return toExitError(err)
 				}
 
+				var env []string
+				for _, item := range tree.Branches[0] {
+					if dotenv.IsComplexValue(item.Value) {
+						return cli.NewExitError(fmt.Errorf("cannot use complex value in environment: %s", item.Value), codes.ErrorGeneric)
+					}
+					if _, ok := item.Key.(sops.Comment); ok {
+						continue
+					}
+					key, ok := item.Key.(string)
+					if !ok {
+						return cli.NewExitError(fmt.Errorf("cannot use non-string keys in environment, got %T", item.Key), codes.ErrorGeneric)
+					}
+					if strings.Contains(key, "=") {
+						return cli.NewExitError(fmt.Errorf("cannot use keys with '=' in environment: %s", key), codes.ErrorGeneric)
+					}
+					value, ok := item.Value.(string)
+					if !ok {
+						return cli.NewExitError(fmt.Errorf("cannot use non-string values in environment, got %T", item.Value), codes.ErrorGeneric)
+					}
+					env = append(env, fmt.Sprintf("%s=%s", key, value))
+				}
+
 				if err := exec.ExecWithEnv(exec.ExecOpts{
 					Command:    command,
-					Plaintext:  output,
+					Plaintext:  []byte{},
 					Background: c.Bool("background"),
 					Pristine:   c.Bool("pristine"),
 					User:       c.String("user"),
+					Env:        env,
 				}); err != nil {
 					return toExitError(err)
 				}
@@ -237,7 +264,7 @@ func main() {
 				},
 				cli.StringFlag{
 					Name:  "filename",
-					Usage: "filename for the temporarily file (default: tmp-file)",
+					Usage: fmt.Sprintf("filename for the temporarily file (default: %s)", exec.FallbackFilename),
 				},
 			}, keyserviceFlags...),
 			Action: func(c *cli.Context) error {
@@ -248,8 +275,14 @@ func main() {
 				fileName := c.Args()[0]
 				command := c.Args()[1]
 
-				inputStore := inputStore(c, fileName)
-				outputStore := outputStore(c, fileName)
+				inputStore, err := inputStore(c, fileName)
+				if err != nil {
+					return toExitError(err)
+				}
+				outputStore, err := outputStore(c, fileName)
+				if err != nil {
+					return toExitError(err)
+				}
 
 				svcs := keyservices(c)
 
@@ -272,11 +305,6 @@ func main() {
 					return toExitError(err)
 				}
 
-				filename := c.String("filename")
-				if filename == "" {
-					filename = "tmp-file"
-				}
-
 				if c.Bool("background") {
 					log.Warn("exec-file's --background option is deprecated and will be removed in a future version of sops")
 				}
@@ -287,7 +315,7 @@ func main() {
 					Background: c.Bool("background"),
 					Fifo:       !c.Bool("no-fifo"),
 					User:       c.String("user"),
-					Filename:   filename,
+					Filename:   c.String("filename"),
 				}); err != nil {
 					return toExitError(err)
 				}
@@ -346,13 +374,17 @@ func main() {
 						return toExitError(err)
 					}
 					if !info.IsDir() {
+						inputStore, err := inputStore(c, subPath)
+						if err != nil {
+							return toExitError(err)
+						}
 						err = publishcmd.Run(publishcmd.Opts{
 							ConfigPath:      configPath,
 							InputPath:       subPath,
 							Cipher:          aes.NewCipher(),
 							KeyServices:     keyservices(c),
 							DecryptionOrder: order,
-							InputStore:      inputStore(c, subPath),
+							InputStore:      inputStore,
 							Interactive:     !c.Bool("yes"),
 							OmitExtensions:  c.Bool("omit-extensions"),
 							Recursive:       c.Bool("recursive"),
@@ -407,6 +439,41 @@ func main() {
 					log.Errorf("Error running keyservice: %s", err)
 					return err
 				}
+				return nil
+			},
+		},
+		{
+			Name:      "filestatus",
+			Usage:     "check the status of the file, returning encryption status",
+			ArgsUsage: `file`,
+			Flags:     []cli.Flag{},
+			Action: func(c *cli.Context) error {
+				if c.NArg() < 1 {
+					return common.NewExitError("Error: no file specified", codes.NoFileSpecified)
+				}
+
+				fileName := c.Args()[0]
+				inputStore, err := inputStore(c, fileName)
+				if err != nil {
+					return toExitError(err)
+				}
+				opts := filestatuscmd.Opts{
+					InputStore: inputStore,
+					InputPath:  fileName,
+				}
+
+				status, err := filestatuscmd.FileStatus(opts)
+				if err != nil {
+					return err
+				}
+
+				json, err := encodingjson.Marshal(status)
+				if err != nil {
+					return common.NewExitError(err, codes.ErrorGeneric)
+				}
+
+				fmt.Println(string(json))
+
 				return nil
 			},
 		},
@@ -509,11 +576,19 @@ func main() {
 								group = append(group, key)
 							}
 						}
+						inputStore, err := inputStore(c, c.String("file"))
+						if err != nil {
+							return toExitError(err)
+						}
+						outputStore, err := outputStore(c, c.String("file"))
+						if err != nil {
+							return toExitError(err)
+						}
 						return groups.Add(groups.AddOpts{
 							InputPath:      c.String("file"),
 							InPlace:        c.Bool("in-place"),
-							InputStore:     inputStore(c, c.String("file")),
-							OutputStore:    outputStore(c, c.String("file")),
+							InputStore:     inputStore,
+							OutputStore:    outputStore,
 							Group:          group,
 							GroupThreshold: c.Int("shamir-secret-sharing-threshold"),
 							KeyServices:    keyservices(c),
@@ -548,11 +623,19 @@ func main() {
 							return fmt.Errorf("failed to parse [index] argument: %s", err)
 						}
 
+						inputStore, err := inputStore(c, c.String("file"))
+						if err != nil {
+							return toExitError(err)
+						}
+						outputStore, err := outputStore(c, c.String("file"))
+						if err != nil {
+							return toExitError(err)
+						}
 						return groups.Delete(groups.DeleteOpts{
 							InputPath:      c.String("file"),
 							InPlace:        c.Bool("in-place"),
-							InputStore:     inputStore(c, c.String("file")),
-							OutputStore:    outputStore(c, c.String("file")),
+							InputStore:     inputStore,
+							OutputStore:    outputStore,
 							Group:          uint(group),
 							GroupThreshold: c.Int("shamir-secret-sharing-threshold"),
 							KeyServices:    keyservices(c),
@@ -593,7 +676,7 @@ func main() {
 				for _, path := range c.Args() {
 					err := updatekeys.UpdateKeys(updatekeys.Opts{
 						InputPath:   path,
-						GroupQuorum: c.Int("shamir-secret-sharing-quorum"),
+						GroupQuorum: c.Int("shamir-secret-sharing-threshold"),
 						KeyServices: keyservices(c),
 						Interactive: !c.Bool("yes"),
 						ConfigPath:  configPath,
@@ -619,6 +702,803 @@ func main() {
 				if failedCounter > 0 {
 					return common.NewExitError(fmt.Errorf("failed updating %d key(s)", failedCounter), codes.ErrorGeneric)
 				}
+				return nil
+			},
+		},
+		{
+			Name:      "decrypt",
+			Usage:     "decrypt a file, and output the results to stdout",
+			ArgsUsage: `file`,
+			Flags: append([]cli.Flag{
+				cli.BoolFlag{
+					Name:  "in-place, i",
+					Usage: "write output back to the same file instead of stdout",
+				},
+				cli.StringFlag{
+					Name:  "extract",
+					Usage: "extract a specific key or branch from the input document. Example: --extract '[\"somekey\"][0]'",
+				},
+				cli.StringFlag{
+					Name:  "output",
+					Usage: "Save the output after decryption to the file specified",
+				},
+				cli.StringFlag{
+					Name:  "input-type",
+					Usage: "currently json, yaml, dotenv and binary are supported. If not set, sops will use the file's extension to determine the type",
+				},
+				cli.StringFlag{
+					Name:  "output-type",
+					Usage: "currently json, yaml, dotenv and binary are supported. If not set, sops will use the input file's extension to determine the output format",
+				},
+				cli.BoolFlag{
+					Name:  "ignore-mac",
+					Usage: "ignore Message Authentication Code during decryption",
+				},
+				cli.StringFlag{
+					Name:  "filename-override",
+					Usage: "Use this filename instead of the provided argument for loading configuration, and for determining input type and output type",
+				},
+				cli.StringFlag{
+					Name:   "decryption-order",
+					Usage:  "comma separated list of decryption key types",
+					EnvVar: "SOPS_DECRYPTION_ORDER",
+				},
+			}, keyserviceFlags...),
+			Action: func(c *cli.Context) error {
+				if c.Bool("verbose") {
+					logging.SetLevel(logrus.DebugLevel)
+				}
+				if c.NArg() < 1 {
+					return common.NewExitError("Error: no file specified", codes.NoFileSpecified)
+				}
+				warnMoreThanOnePositionalArgument(c)
+				if c.Bool("in-place") && c.String("output") != "" {
+					return common.NewExitError("Error: cannot operate on both --output and --in-place", codes.ErrorConflictingParameters)
+				}
+				fileName, err := filepath.Abs(c.Args()[0])
+				if err != nil {
+					return toExitError(err)
+				}
+				if _, err := os.Stat(fileName); os.IsNotExist(err) {
+					return common.NewExitError(fmt.Sprintf("Error: cannot operate on non-existent file %q", fileName), codes.NoFileSpecified)
+				}
+				fileNameOverride := c.String("filename-override")
+				if fileNameOverride == "" {
+					fileNameOverride = fileName
+				}
+
+				inputStore, err := inputStore(c, fileNameOverride)
+				if err != nil {
+					return toExitError(err)
+				}
+				outputStore, err := outputStore(c, fileNameOverride)
+				if err != nil {
+					return toExitError(err)
+				}
+				svcs := keyservices(c)
+
+				order, err := decryptionOrder(c.String("decryption-order"))
+				if err != nil {
+					return toExitError(err)
+				}
+
+				var extract []interface{}
+				extract, err = parseTreePath(c.String("extract"))
+				if err != nil {
+					return common.NewExitError(fmt.Errorf("error parsing --extract path: %s", err), codes.InvalidTreePathFormat)
+				}
+				output, err := decrypt(decryptOpts{
+					OutputStore:     outputStore,
+					InputStore:      inputStore,
+					InputPath:       fileName,
+					Cipher:          aes.NewCipher(),
+					Extract:         extract,
+					KeyServices:     svcs,
+					DecryptionOrder: order,
+					IgnoreMAC:       c.Bool("ignore-mac"),
+				})
+				if err != nil {
+					return toExitError(err)
+				}
+
+				// We open the file *after* the operations on the tree have been
+				// executed to avoid truncating it when there's errors
+				if c.Bool("in-place") {
+					file, err := os.Create(fileName)
+					if err != nil {
+						return common.NewExitError(fmt.Sprintf("Could not open in-place file for writing: %s", err), codes.CouldNotWriteOutputFile)
+					}
+					defer file.Close()
+					_, err = file.Write(output)
+					if err != nil {
+						return toExitError(err)
+					}
+					log.Info("File written successfully")
+					return nil
+				}
+
+				outputFile := os.Stdout
+				if c.String("output") != "" {
+					file, err := os.Create(c.String("output"))
+					if err != nil {
+						return common.NewExitError(fmt.Sprintf("Could not open output file for writing: %s", err), codes.CouldNotWriteOutputFile)
+					}
+					defer file.Close()
+					outputFile = file
+				}
+				_, err = outputFile.Write(output)
+				return toExitError(err)
+			},
+		},
+		{
+			Name:      "encrypt",
+			Usage:     "encrypt a file, and output the results to stdout",
+			ArgsUsage: `file`,
+			Flags: append([]cli.Flag{
+				cli.BoolFlag{
+					Name:  "in-place, i",
+					Usage: "write output back to the same file instead of stdout",
+				},
+				cli.StringFlag{
+					Name:  "output",
+					Usage: "Save the output after decryption to the file specified",
+				},
+				cli.StringFlag{
+					Name:   "kms, k",
+					Usage:  "comma separated list of KMS ARNs",
+					EnvVar: "SOPS_KMS_ARN",
+				},
+				cli.StringFlag{
+					Name:  "aws-profile",
+					Usage: "The AWS profile to use for requests to AWS",
+				},
+				cli.StringFlag{
+					Name:   "gcp-kms",
+					Usage:  "comma separated list of GCP KMS resource IDs",
+					EnvVar: "SOPS_GCP_KMS_IDS",
+				},
+				cli.StringFlag{
+					Name:   "azure-kv",
+					Usage:  "comma separated list of Azure Key Vault URLs",
+					EnvVar: "SOPS_AZURE_KEYVAULT_URLS",
+				},
+				cli.StringFlag{
+					Name:   "hc-vault-transit",
+					Usage:  "comma separated list of vault's key URI (e.g. 'https://vault.example.org:8200/v1/transit/keys/dev')",
+					EnvVar: "SOPS_VAULT_URIS",
+				},
+				cli.StringFlag{
+					Name:   "pgp, p",
+					Usage:  "comma separated list of PGP fingerprints",
+					EnvVar: "SOPS_PGP_FP",
+				},
+				cli.StringFlag{
+					Name:   "age, a",
+					Usage:  "comma separated list of age recipients",
+					EnvVar: "SOPS_AGE_RECIPIENTS",
+				},
+				cli.StringFlag{
+					Name:  "input-type",
+					Usage: "currently json, yaml, dotenv and binary are supported. If not set, sops will use the file's extension to determine the type",
+				},
+				cli.StringFlag{
+					Name:  "output-type",
+					Usage: "currently json, yaml, dotenv and binary are supported. If not set, sops will use the input file's extension to determine the output format",
+				},
+				cli.StringFlag{
+					Name:  "unencrypted-suffix",
+					Usage: "override the unencrypted key suffix.",
+				},
+				cli.StringFlag{
+					Name:  "encrypted-suffix",
+					Usage: "override the encrypted key suffix. When empty, all keys will be encrypted, unless otherwise marked with unencrypted-suffix.",
+				},
+				cli.StringFlag{
+					Name:  "unencrypted-regex",
+					Usage: "set the unencrypted key regex. When specified, only keys matching the regex will be left unencrypted.",
+				},
+				cli.StringFlag{
+					Name:  "encrypted-regex",
+					Usage: "set the encrypted key regex. When specified, only keys matching the regex will be encrypted.",
+				},
+				cli.StringFlag{
+					Name:  "encryption-context",
+					Usage: "comma separated list of KMS encryption context key:value pairs",
+				},
+				cli.IntFlag{
+					Name:  "shamir-secret-sharing-threshold",
+					Usage: "the number of master keys required to retrieve the data key with shamir",
+				},
+				cli.StringFlag{
+					Name:  "filename-override",
+					Usage: "Use this filename instead of the provided argument for loading configuration, and for determining input type and output type",
+				},
+			}, keyserviceFlags...),
+			Action: func(c *cli.Context) error {
+				if c.Bool("verbose") {
+					logging.SetLevel(logrus.DebugLevel)
+				}
+				if c.NArg() < 1 {
+					return common.NewExitError("Error: no file specified", codes.NoFileSpecified)
+				}
+				warnMoreThanOnePositionalArgument(c)
+				if c.Bool("in-place") && c.String("output") != "" {
+					return common.NewExitError("Error: cannot operate on both --output and --in-place", codes.ErrorConflictingParameters)
+				}
+				fileName, err := filepath.Abs(c.Args()[0])
+				if err != nil {
+					return toExitError(err)
+				}
+				if _, err := os.Stat(fileName); os.IsNotExist(err) {
+					return common.NewExitError(fmt.Sprintf("Error: cannot operate on non-existent file %q", fileName), codes.NoFileSpecified)
+				}
+				fileNameOverride := c.String("filename-override")
+				if fileNameOverride == "" {
+					fileNameOverride = fileName
+				}
+
+				inputStore, err := inputStore(c, fileNameOverride)
+				if err != nil {
+					return toExitError(err)
+				}
+				outputStore, err := outputStore(c, fileNameOverride)
+				if err != nil {
+					return toExitError(err)
+				}
+				svcs := keyservices(c)
+
+				encConfig, err := getEncryptConfig(c, fileNameOverride)
+				if err != nil {
+					return toExitError(err)
+				}
+				output, err := encrypt(encryptOpts{
+					OutputStore:   outputStore,
+					InputStore:    inputStore,
+					InputPath:     fileName,
+					Cipher:        aes.NewCipher(),
+					KeyServices:   svcs,
+					encryptConfig: encConfig,
+				})
+
+				if err != nil {
+					return toExitError(err)
+				}
+
+				// We open the file *after* the operations on the tree have been
+				// executed to avoid truncating it when there's errors
+				if c.Bool("in-place") {
+					file, err := os.Create(fileName)
+					if err != nil {
+						return common.NewExitError(fmt.Sprintf("Could not open in-place file for writing: %s", err), codes.CouldNotWriteOutputFile)
+					}
+					defer file.Close()
+					_, err = file.Write(output)
+					if err != nil {
+						return toExitError(err)
+					}
+					log.Info("File written successfully")
+					return nil
+				}
+
+				outputFile := os.Stdout
+				if c.String("output") != "" {
+					file, err := os.Create(c.String("output"))
+					if err != nil {
+						return common.NewExitError(fmt.Sprintf("Could not open output file for writing: %s", err), codes.CouldNotWriteOutputFile)
+					}
+					defer file.Close()
+					outputFile = file
+				}
+				_, err = outputFile.Write(output)
+				return toExitError(err)
+			},
+		},
+		{
+			Name:      "rotate",
+			Usage:     "generate a new data encryption key and reencrypt all values with the new key",
+			ArgsUsage: `file`,
+			Flags: append([]cli.Flag{
+				cli.BoolFlag{
+					Name:  "in-place, i",
+					Usage: "write output back to the same file instead of stdout",
+				},
+				cli.StringFlag{
+					Name:  "output",
+					Usage: "Save the output after decryption to the file specified",
+				},
+				cli.StringFlag{
+					Name:  "input-type",
+					Usage: "currently json, yaml, dotenv and binary are supported. If not set, sops will use the file's extension to determine the type",
+				},
+				cli.StringFlag{
+					Name:  "output-type",
+					Usage: "currently json, yaml, dotenv and binary are supported. If not set, sops will use the input file's extension to determine the output format",
+				},
+				cli.StringFlag{
+					Name:  "encryption-context",
+					Usage: "comma separated list of KMS encryption context key:value pairs",
+				},
+				cli.StringFlag{
+					Name:  "add-gcp-kms",
+					Usage: "add the provided comma-separated list of GCP KMS key resource IDs to the list of master keys on the given file",
+				},
+				cli.StringFlag{
+					Name:  "rm-gcp-kms",
+					Usage: "remove the provided comma-separated list of GCP KMS key resource IDs from the list of master keys on the given file",
+				},
+				cli.StringFlag{
+					Name:  "add-azure-kv",
+					Usage: "add the provided comma-separated list of Azure Key Vault key URLs to the list of master keys on the given file",
+				},
+				cli.StringFlag{
+					Name:  "rm-azure-kv",
+					Usage: "remove the provided comma-separated list of Azure Key Vault key URLs from the list of master keys on the given file",
+				},
+				cli.StringFlag{
+					Name:  "add-kms",
+					Usage: "add the provided comma-separated list of KMS ARNs to the list of master keys on the given file",
+				},
+				cli.StringFlag{
+					Name:  "rm-kms",
+					Usage: "remove the provided comma-separated list of KMS ARNs from the list of master keys on the given file",
+				},
+				cli.StringFlag{
+					Name:  "add-hc-vault-transit",
+					Usage: "add the provided comma-separated list of Vault's URI key to the list of master keys on the given file ( eg. https://vault.example.org:8200/v1/transit/keys/dev)",
+				},
+				cli.StringFlag{
+					Name:  "rm-hc-vault-transit",
+					Usage: "remove the provided comma-separated list of Vault's URI key from the list of master keys on the given file ( eg. https://vault.example.org:8200/v1/transit/keys/dev)",
+				},
+				cli.StringFlag{
+					Name:  "add-age",
+					Usage: "add the provided comma-separated list of age recipients fingerprints to the list of master keys on the given file",
+				},
+				cli.StringFlag{
+					Name:  "rm-age",
+					Usage: "remove the provided comma-separated list of age recipients from the list of master keys on the given file",
+				},
+				cli.StringFlag{
+					Name:  "add-pgp",
+					Usage: "add the provided comma-separated list of PGP fingerprints to the list of master keys on the given file",
+				},
+				cli.StringFlag{
+					Name:  "rm-pgp",
+					Usage: "remove the provided comma-separated list of PGP fingerprints from the list of master keys on the given file",
+				},
+				cli.StringFlag{
+					Name:  "filename-override",
+					Usage: "Use this filename instead of the provided argument for loading configuration, and for determining input type and output type",
+				},
+				cli.StringFlag{
+					Name:   "decryption-order",
+					Usage:  "comma separated list of decryption key types",
+					EnvVar: "SOPS_DECRYPTION_ORDER",
+				},
+			}, keyserviceFlags...),
+			Action: func(c *cli.Context) error {
+				if c.Bool("verbose") {
+					logging.SetLevel(logrus.DebugLevel)
+				}
+				if c.NArg() < 1 {
+					return common.NewExitError("Error: no file specified", codes.NoFileSpecified)
+				}
+				warnMoreThanOnePositionalArgument(c)
+				if c.Bool("in-place") && c.String("output") != "" {
+					return common.NewExitError("Error: cannot operate on both --output and --in-place", codes.ErrorConflictingParameters)
+				}
+				fileName, err := filepath.Abs(c.Args()[0])
+				if err != nil {
+					return toExitError(err)
+				}
+				if _, err := os.Stat(fileName); os.IsNotExist(err) {
+					if c.String("add-kms") != "" || c.String("add-pgp") != "" || c.String("add-gcp-kms") != "" || c.String("add-hc-vault-transit") != "" || c.String("add-azure-kv") != "" || c.String("add-age") != "" ||
+						c.String("rm-kms") != "" || c.String("rm-pgp") != "" || c.String("rm-gcp-kms") != "" || c.String("rm-hc-vault-transit") != "" || c.String("rm-azure-kv") != "" || c.String("rm-age") != "" {
+						return common.NewExitError(fmt.Sprintf("Error: cannot add or remove keys on non-existent file %q, use the `edit` subcommand instead.", fileName), codes.CannotChangeKeysFromNonExistentFile)
+					}
+				}
+				fileNameOverride := c.String("filename-override")
+				if fileNameOverride == "" {
+					fileNameOverride = fileName
+				}
+
+				inputStore, err := inputStore(c, fileNameOverride)
+				if err != nil {
+					return toExitError(err)
+				}
+				outputStore, err := outputStore(c, fileNameOverride)
+				if err != nil {
+					return toExitError(err)
+				}
+				svcs := keyservices(c)
+
+				order, err := decryptionOrder(c.String("decryption-order"))
+				if err != nil {
+					return toExitError(err)
+				}
+
+				rotateOpts, err := getRotateOpts(c, fileName, inputStore, outputStore, svcs, order)
+				if err != nil {
+					return toExitError(err)
+				}
+				output, err := rotate(rotateOpts)
+				if err != nil {
+					return toExitError(err)
+				}
+
+				// We open the file *after* the operations on the tree have been
+				// executed to avoid truncating it when there's errors
+				if c.Bool("in-place") {
+					file, err := os.Create(fileName)
+					if err != nil {
+						return common.NewExitError(fmt.Sprintf("Could not open in-place file for writing: %s", err), codes.CouldNotWriteOutputFile)
+					}
+					defer file.Close()
+					_, err = file.Write(output)
+					if err != nil {
+						return toExitError(err)
+					}
+					log.Info("File written successfully")
+					return nil
+				}
+
+				outputFile := os.Stdout
+				if c.String("output") != "" {
+					file, err := os.Create(c.String("output"))
+					if err != nil {
+						return common.NewExitError(fmt.Sprintf("Could not open output file for writing: %s", err), codes.CouldNotWriteOutputFile)
+					}
+					defer file.Close()
+					outputFile = file
+				}
+				_, err = outputFile.Write(output)
+				return toExitError(err)
+			},
+		},
+		{
+			Name:      "edit",
+			Usage:     "edit an encrypted file",
+			ArgsUsage: `file`,
+			Flags: append([]cli.Flag{
+				cli.StringFlag{
+					Name:   "kms, k",
+					Usage:  "comma separated list of KMS ARNs",
+					EnvVar: "SOPS_KMS_ARN",
+				},
+				cli.StringFlag{
+					Name:  "aws-profile",
+					Usage: "The AWS profile to use for requests to AWS",
+				},
+				cli.StringFlag{
+					Name:   "gcp-kms",
+					Usage:  "comma separated list of GCP KMS resource IDs",
+					EnvVar: "SOPS_GCP_KMS_IDS",
+				},
+				cli.StringFlag{
+					Name:   "azure-kv",
+					Usage:  "comma separated list of Azure Key Vault URLs",
+					EnvVar: "SOPS_AZURE_KEYVAULT_URLS",
+				},
+				cli.StringFlag{
+					Name:   "hc-vault-transit",
+					Usage:  "comma separated list of vault's key URI (e.g. 'https://vault.example.org:8200/v1/transit/keys/dev')",
+					EnvVar: "SOPS_VAULT_URIS",
+				},
+				cli.StringFlag{
+					Name:   "pgp, p",
+					Usage:  "comma separated list of PGP fingerprints",
+					EnvVar: "SOPS_PGP_FP",
+				},
+				cli.StringFlag{
+					Name:   "age, a",
+					Usage:  "comma separated list of age recipients",
+					EnvVar: "SOPS_AGE_RECIPIENTS",
+				},
+				cli.StringFlag{
+					Name:  "input-type",
+					Usage: "currently json, yaml, dotenv and binary are supported. If not set, sops will use the file's extension to determine the type",
+				},
+				cli.StringFlag{
+					Name:  "output-type",
+					Usage: "currently json, yaml, dotenv and binary are supported. If not set, sops will use the input file's extension to determine the output format",
+				},
+				cli.StringFlag{
+					Name:  "unencrypted-suffix",
+					Usage: "override the unencrypted key suffix.",
+				},
+				cli.StringFlag{
+					Name:  "encrypted-suffix",
+					Usage: "override the encrypted key suffix. When empty, all keys will be encrypted, unless otherwise marked with unencrypted-suffix.",
+				},
+				cli.StringFlag{
+					Name:  "unencrypted-regex",
+					Usage: "set the unencrypted key regex. When specified, only keys matching the regex will be left unencrypted.",
+				},
+				cli.StringFlag{
+					Name:  "encrypted-regex",
+					Usage: "set the encrypted key regex. When specified, only keys matching the regex will be encrypted.",
+				},
+				cli.StringFlag{
+					Name:  "encryption-context",
+					Usage: "comma separated list of KMS encryption context key:value pairs",
+				},
+				cli.IntFlag{
+					Name:  "shamir-secret-sharing-threshold",
+					Usage: "the number of master keys required to retrieve the data key with shamir",
+				},
+				cli.BoolFlag{
+					Name:  "show-master-keys, s",
+					Usage: "display master encryption keys in the file during editing",
+				},
+				cli.BoolFlag{
+					Name:  "ignore-mac",
+					Usage: "ignore Message Authentication Code during decryption",
+				},
+				cli.StringFlag{
+					Name:   "decryption-order",
+					Usage:  "comma separated list of decryption key types",
+					EnvVar: "SOPS_DECRYPTION_ORDER",
+				},
+			}, keyserviceFlags...),
+			Action: func(c *cli.Context) error {
+				if c.Bool("verbose") {
+					logging.SetLevel(logrus.DebugLevel)
+				}
+				if c.NArg() < 1 {
+					return common.NewExitError("Error: no file specified", codes.NoFileSpecified)
+				}
+				warnMoreThanOnePositionalArgument(c)
+				fileName, err := filepath.Abs(c.Args()[0])
+				if err != nil {
+					return toExitError(err)
+				}
+
+				inputStore, err := inputStore(c, fileName)
+				if err != nil {
+					return toExitError(err)
+				}
+				outputStore, err := outputStore(c, fileName)
+				if err != nil {
+					return toExitError(err)
+				}
+				svcs := keyservices(c)
+
+				order, err := decryptionOrder(c.String("decryption-order"))
+				if err != nil {
+					return toExitError(err)
+				}
+				var output []byte
+				_, statErr := os.Stat(fileName)
+				fileExists := statErr == nil
+				opts := editOpts{
+					OutputStore:     outputStore,
+					InputStore:      inputStore,
+					InputPath:       fileName,
+					Cipher:          aes.NewCipher(),
+					KeyServices:     svcs,
+					DecryptionOrder: order,
+					IgnoreMAC:       c.Bool("ignore-mac"),
+					ShowMasterKeys:  c.Bool("show-master-keys"),
+				}
+				if fileExists {
+					output, err = edit(opts)
+					if err != nil {
+						return toExitError(err)
+					}
+				} else {
+					// File doesn't exist, edit the example file instead
+					encConfig, err := getEncryptConfig(c, fileName)
+					if err != nil {
+						return toExitError(err)
+					}
+					output, err = editExample(editExampleOpts{
+						editOpts:      opts,
+						encryptConfig: encConfig,
+					})
+					if err != nil {
+						return toExitError(err)
+					}
+				}
+
+				// We open the file *after* the operations on the tree have been
+				// executed to avoid truncating it when there's errors
+				file, err := os.Create(fileName)
+				if err != nil {
+					return common.NewExitError(fmt.Sprintf("Could not open in-place file for writing: %s", err), codes.CouldNotWriteOutputFile)
+				}
+				defer file.Close()
+				_, err = file.Write(output)
+				if err != nil {
+					return toExitError(err)
+				}
+				log.Info("File written successfully")
+				return nil
+			},
+		},
+		{
+			Name:      "set",
+			Usage:     `set a specific key or branch in the input document. value must be a json encoded string. eg. '/path/to/file ["somekey"][0] {"somevalue":true}'`,
+			ArgsUsage: `file index value`,
+			Flags: append([]cli.Flag{
+				cli.StringFlag{
+					Name:  "input-type",
+					Usage: "currently json, yaml, dotenv and binary are supported. If not set, sops will use the file's extension to determine the type",
+				},
+				cli.StringFlag{
+					Name:  "output-type",
+					Usage: "currently json, yaml, dotenv and binary are supported. If not set, sops will use the input file's extension to determine the output format",
+				},
+				cli.IntFlag{
+					Name:  "shamir-secret-sharing-threshold",
+					Usage: "the number of master keys required to retrieve the data key with shamir",
+				},
+				cli.BoolFlag{
+					Name:  "ignore-mac",
+					Usage: "ignore Message Authentication Code during decryption",
+				},
+				cli.StringFlag{
+					Name:   "decryption-order",
+					Usage:  "comma separated list of decryption key types",
+					EnvVar: "SOPS_DECRYPTION_ORDER",
+				},
+			}, keyserviceFlags...),
+			Action: func(c *cli.Context) error {
+				if c.Bool("verbose") {
+					logging.SetLevel(logrus.DebugLevel)
+				}
+				if c.NArg() != 3 {
+					return common.NewExitError("Error: no file specified, or index and value are missing", codes.NoFileSpecified)
+				}
+				fileName, err := filepath.Abs(c.Args()[0])
+				if err != nil {
+					return toExitError(err)
+				}
+
+				inputStore, err := inputStore(c, fileName)
+				if err != nil {
+					return toExitError(err)
+				}
+				outputStore, err := outputStore(c, fileName)
+				if err != nil {
+					return toExitError(err)
+				}
+				svcs := keyservices(c)
+
+				path, err := parseTreePath(c.Args()[1])
+				if err != nil {
+					return common.NewExitError("Invalid set index format", codes.ErrorInvalidSetFormat)
+				}
+
+				value, err := jsonValueToTreeInsertableValue(c.Args()[2])
+				if err != nil {
+					return toExitError(err)
+				}
+
+				order, err := decryptionOrder(c.String("decryption-order"))
+				if err != nil {
+					return toExitError(err)
+				}
+				output, err := set(setOpts{
+					OutputStore:     outputStore,
+					InputStore:      inputStore,
+					InputPath:       fileName,
+					Cipher:          aes.NewCipher(),
+					KeyServices:     svcs,
+					DecryptionOrder: order,
+					IgnoreMAC:       c.Bool("ignore-mac"),
+					Value:           value,
+					TreePath:        path,
+				})
+				if err != nil {
+					return toExitError(err)
+				}
+
+				// We open the file *after* the operations on the tree have been
+				// executed to avoid truncating it when there's errors
+				file, err := os.Create(fileName)
+				if err != nil {
+					return common.NewExitError(fmt.Sprintf("Could not open in-place file for writing: %s", err), codes.CouldNotWriteOutputFile)
+				}
+				defer file.Close()
+				_, err = file.Write(output)
+				if err != nil {
+					return toExitError(err)
+				}
+				log.Info("File written successfully")
+				return nil
+			},
+		},
+		{
+			Name:      "unset",
+			Usage:     `unset a specific key or branch in the input document.`,
+			ArgsUsage: `file index`,
+			Flags: append([]cli.Flag{
+				cli.StringFlag{
+					Name:  "input-type",
+					Usage: "currently json, yaml, dotenv and binary are supported. If not set, sops will use the file's extension to determine the type",
+				},
+				cli.StringFlag{
+					Name:  "output-type",
+					Usage: "currently json, yaml, dotenv and binary are supported. If not set, sops will use the input file's extension to determine the output format",
+				},
+				cli.IntFlag{
+					Name:  "shamir-secret-sharing-threshold",
+					Usage: "the number of master keys required to retrieve the data key with shamir",
+				},
+				cli.BoolFlag{
+					Name:  "ignore-mac",
+					Usage: "ignore Message Authentication Code during decryption",
+				},
+				cli.StringFlag{
+					Name:   "decryption-order",
+					Usage:  "comma separated list of decryption key types",
+					EnvVar: "SOPS_DECRYPTION_ORDER",
+				},
+				cli.BoolFlag{
+					Name:  "idempotent",
+					Usage: "do nothing if the given index does not exist",
+				},
+			}, keyserviceFlags...),
+			Action: func(c *cli.Context) error {
+				if c.Bool("verbose") {
+					logging.SetLevel(logrus.DebugLevel)
+				}
+				if c.NArg() != 2 {
+					return common.NewExitError("Error: no file specified, or index is missing", codes.NoFileSpecified)
+				}
+				fileName, err := filepath.Abs(c.Args()[0])
+				if err != nil {
+					return toExitError(err)
+				}
+
+				inputStore, err := inputStore(c, fileName)
+				if err != nil {
+					return toExitError(err)
+				}
+				outputStore, err := outputStore(c, fileName)
+				if err != nil {
+					return toExitError(err)
+				}
+				svcs := keyservices(c)
+
+				path, err := parseTreePath(c.Args()[1])
+				if err != nil {
+					return common.NewExitError("Invalid unset index format", codes.ErrorInvalidSetFormat)
+				}
+
+				order, err := decryptionOrder(c.String("decryption-order"))
+				if err != nil {
+					return toExitError(err)
+				}
+				output, err := unset(unsetOpts{
+					OutputStore:     outputStore,
+					InputStore:      inputStore,
+					InputPath:       fileName,
+					Cipher:          aes.NewCipher(),
+					KeyServices:     svcs,
+					DecryptionOrder: order,
+					IgnoreMAC:       c.Bool("ignore-mac"),
+					TreePath:        path,
+				})
+				if err != nil {
+					if _, ok := err.(*sops.SopsKeyNotFound); ok && c.Bool("idempotent") {
+						return nil
+					}
+					return toExitError(err)
+				}
+
+				// We open the file *after* the operations on the tree have been
+				// executed to avoid truncating it when there's errors
+				file, err := os.Create(fileName)
+				if err != nil {
+					return common.NewExitError(fmt.Sprintf("Could not open in-place file for writing: %s", err), codes.CouldNotWriteOutputFile)
+				}
+				defer file.Close()
+				_, err = file.Write(output)
+				if err != nil {
+					return toExitError(err)
+				}
+				log.Info("File written successfully")
 				return nil
 			},
 		},
@@ -767,6 +1647,14 @@ func main() {
 			Usage: "set the encrypted key regex. When specified, only keys matching the regex will be encrypted.",
 		},
 		cli.StringFlag{
+			Name:  "unencrypted-comment-regex",
+			Usage: "set the unencrypted comment suffix. When specified, only keys that have comment matching the regex will be left unencrypted.",
+		},
+		cli.StringFlag{
+			Name:  "encrypted-comment-regex",
+			Usage: "set the encrypted comment suffix. When specified, only keys that have comment matching the regex will be encrypted.",
+		},
+		cli.StringFlag{
 			Name:  "config",
 			Usage: "path to sops' config file. If set, sops will not search for the config file recursively.",
 		},
@@ -806,6 +1694,12 @@ func main() {
 	}, keyserviceFlags...)
 
 	app.Action = func(c *cli.Context) error {
+		isDecryptMode := c.Bool("decrypt")
+		isEncryptMode := c.Bool("encrypt")
+		isRotateMode := c.Bool("rotate")
+		isSetMode := c.String("set") != ""
+		isEditMode := !isEncryptMode && !isDecryptMode && !isRotateMode && !isSetMode
+
 		if c.Bool("verbose") {
 			logging.SetLevel(logrus.DebugLevel)
 		}
@@ -823,10 +1717,10 @@ func main() {
 		if _, err := os.Stat(fileName); os.IsNotExist(err) {
 			if c.String("add-kms") != "" || c.String("add-pgp") != "" || c.String("add-gcp-kms") != "" || c.String("add-hc-vault-transit") != "" || c.String("add-azure-kv") != "" || c.String("add-age") != "" ||
 				c.String("rm-kms") != "" || c.String("rm-pgp") != "" || c.String("rm-gcp-kms") != "" || c.String("rm-hc-vault-transit") != "" || c.String("rm-azure-kv") != "" || c.String("rm-age") != "" {
-				return common.NewExitError("Error: cannot add or remove keys on non-existent files, use `--kms` and `--pgp` instead.", codes.CannotChangeKeysFromNonExistentFile)
+				return common.NewExitError(fmt.Sprintf("Error: cannot add or remove keys on non-existent file %q, use `--kms` and `--pgp` instead.", fileName), codes.CannotChangeKeysFromNonExistentFile)
 			}
-			if c.Bool("encrypt") || c.Bool("decrypt") || c.Bool("rotate") {
-				return common.NewExitError("Error: cannot operate on non-existent file", codes.NoFileSpecified)
+			if isEncryptMode || isDecryptMode || isRotateMode {
+				return common.NewExitError(fmt.Sprintf("Error: cannot operate on non-existent file %q", fileName), codes.NoFileSpecified)
 			}
 		}
 		fileNameOverride := c.String("filename-override")
@@ -834,59 +1728,41 @@ func main() {
 			fileNameOverride = fileName
 		}
 
-		unencryptedSuffix := c.String("unencrypted-suffix")
-		encryptedSuffix := c.String("encrypted-suffix")
-		encryptedRegex := c.String("encrypted-regex")
-		unencryptedRegex := c.String("unencrypted-regex")
-		macOnlyEncrypted := c.Bool("mac-only-encrypted")
-		conf, err := loadConfig(c, fileNameOverride, nil)
+		commandCount := 0
+		if isDecryptMode {
+			commandCount++
+		}
+		if isEncryptMode {
+			commandCount++
+		}
+		if isRotateMode {
+			commandCount++
+		}
+		if isSetMode {
+			commandCount++
+		}
+		if commandCount > 1 {
+			log.Warn("More than one command (--encrypt, --decrypt, --rotate, --set) has been specified. Only the changes made by the last one will be visible. Note that this behavior is deprecated and will cause an error eventually.")
+		}
+
+		// Load configuration here for backwards compatibility (error out in case of bad config files),
+		// but only when not just decrypting (https://github.com/getsops/sops/issues/868)
+		needsCreationRule := isEncryptMode || isRotateMode || isSetMode || isEditMode
+		if needsCreationRule {
+			_, err = loadConfig(c, fileNameOverride, nil)
+			if err != nil {
+				return toExitError(err)
+			}
+		}
+
+		inputStore, err := inputStore(c, fileNameOverride)
 		if err != nil {
 			return toExitError(err)
 		}
-		if conf != nil {
-			// command line options have precedence
-			if unencryptedSuffix == "" {
-				unencryptedSuffix = conf.UnencryptedSuffix
-			}
-			if encryptedSuffix == "" {
-				encryptedSuffix = conf.EncryptedSuffix
-			}
-			if encryptedRegex == "" {
-				encryptedRegex = conf.EncryptedRegex
-			}
-			if unencryptedRegex == "" {
-				unencryptedRegex = conf.UnencryptedRegex
-			}
-			if !macOnlyEncrypted {
-				macOnlyEncrypted = conf.MACOnlyEncrypted
-			}
+		outputStore, err := outputStore(c, fileNameOverride)
+		if err != nil {
+			return toExitError(err)
 		}
-
-		cryptRuleCount := 0
-		if unencryptedSuffix != "" {
-			cryptRuleCount++
-		}
-		if encryptedSuffix != "" {
-			cryptRuleCount++
-		}
-		if encryptedRegex != "" {
-			cryptRuleCount++
-		}
-		if unencryptedRegex != "" {
-			cryptRuleCount++
-		}
-
-		if cryptRuleCount > 1 {
-			return common.NewExitError("Error: cannot use more than one of encrypted_suffix, unencrypted_suffix, encrypted_regex or unencrypted_regex in the same file", codes.ErrorConflictingParameters)
-		}
-
-		// only supply the default UnencryptedSuffix when EncryptedSuffix and EncryptedRegex are not provided
-		if cryptRuleCount == 0 {
-			unencryptedSuffix = sops.DefaultUnencryptedSuffix
-		}
-
-		inputStore := inputStore(c, fileNameOverride)
-		outputStore := outputStore(c, fileNameOverride)
 		svcs := keyservices(c)
 
 		order, err := decryptionOrder(c.String("decryption-order"))
@@ -894,34 +1770,28 @@ func main() {
 			return toExitError(err)
 		}
 		var output []byte
-		if c.Bool("encrypt") {
-			var groups []sops.KeyGroup
-			groups, err = keyGroups(c, fileNameOverride)
-			if err != nil {
-				return toExitError(err)
-			}
-			var threshold int
-			threshold, err = shamirThreshold(c, fileNameOverride)
+		if isEncryptMode {
+			encConfig, err := getEncryptConfig(c, fileNameOverride)
 			if err != nil {
 				return toExitError(err)
 			}
 			output, err = encrypt(encryptOpts{
-				OutputStore:       outputStore,
-				InputStore:        inputStore,
-				InputPath:         fileName,
-				Cipher:            aes.NewCipher(),
-				UnencryptedSuffix: unencryptedSuffix,
-				EncryptedSuffix:   encryptedSuffix,
-				UnencryptedRegex:  unencryptedRegex,
-				EncryptedRegex:    encryptedRegex,
-				MACOnlyEncrypted:  macOnlyEncrypted,
-				KeyServices:       svcs,
-				KeyGroups:         groups,
-				GroupThreshold:    threshold,
+				OutputStore:   outputStore,
+				InputStore:    inputStore,
+				InputPath:     fileName,
+				Cipher:        aes.NewCipher(),
+				KeyServices:   svcs,
+				encryptConfig: encConfig,
 			})
+			// While this check is also done below, the `err` in this scope shadows
+			// the `err` in the outer scope.  **Only** do this in case --decrypt,
+			// --rotate-, and --set are not specified, though, to keep old behavior.
+			if err != nil && !isDecryptMode && !isRotateMode && !isSetMode {
+				return toExitError(err)
+			}
 		}
 
-		if c.Bool("decrypt") {
+		if isDecryptMode {
 			var extract []interface{}
 			extract, err = parseTreePath(c.String("extract"))
 			if err != nil {
@@ -938,83 +1808,13 @@ func main() {
 				IgnoreMAC:       c.Bool("ignore-mac"),
 			})
 		}
-		if c.Bool("rotate") {
-			var addMasterKeys []keys.MasterKey
-			kmsEncryptionContext := kms.ParseKMSContext(c.String("encryption-context"))
-			for _, k := range kms.MasterKeysFromArnString(c.String("add-kms"), kmsEncryptionContext, c.String("aws-profile")) {
-				addMasterKeys = append(addMasterKeys, k)
-			}
-			for _, k := range pgp.MasterKeysFromFingerprintString(c.String("add-pgp")) {
-				addMasterKeys = append(addMasterKeys, k)
-			}
-			for _, k := range gcpkms.MasterKeysFromResourceIDString(c.String("add-gcp-kms")) {
-				addMasterKeys = append(addMasterKeys, k)
-			}
-			azureKeys, err := azkv.MasterKeysFromURLs(c.String("add-azure-kv"))
+		if isRotateMode {
+			rotateOpts, err := getRotateOpts(c, fileName, inputStore, outputStore, svcs, order)
 			if err != nil {
 				return toExitError(err)
-			}
-			for _, k := range azureKeys {
-				addMasterKeys = append(addMasterKeys, k)
-			}
-			hcVaultKeys, err := hcvault.NewMasterKeysFromURIs(c.String("add-hc-vault-transit"))
-			if err != nil {
-				return toExitError(err)
-			}
-			for _, k := range hcVaultKeys {
-				addMasterKeys = append(addMasterKeys, k)
-			}
-			ageKeys, err := age.MasterKeysFromRecipients(c.String("add-age"))
-			if err != nil {
-				return toExitError(err)
-			}
-			for _, k := range ageKeys {
-				addMasterKeys = append(addMasterKeys, k)
 			}
 
-			var rmMasterKeys []keys.MasterKey
-			for _, k := range kms.MasterKeysFromArnString(c.String("rm-kms"), kmsEncryptionContext, c.String("aws-profile")) {
-				rmMasterKeys = append(rmMasterKeys, k)
-			}
-			for _, k := range pgp.MasterKeysFromFingerprintString(c.String("rm-pgp")) {
-				rmMasterKeys = append(rmMasterKeys, k)
-			}
-			for _, k := range gcpkms.MasterKeysFromResourceIDString(c.String("rm-gcp-kms")) {
-				rmMasterKeys = append(rmMasterKeys, k)
-			}
-			azureKeys, err = azkv.MasterKeysFromURLs(c.String("rm-azure-kv"))
-			if err != nil {
-				return toExitError(err)
-			}
-			for _, k := range azureKeys {
-				rmMasterKeys = append(rmMasterKeys, k)
-			}
-			hcVaultKeys, err = hcvault.NewMasterKeysFromURIs(c.String("rm-hc-vault-transit"))
-			if err != nil {
-				return toExitError(err)
-			}
-			for _, k := range hcVaultKeys {
-				rmMasterKeys = append(rmMasterKeys, k)
-			}
-			ageKeys, err = age.MasterKeysFromRecipients(c.String("rm-age"))
-			if err != nil {
-				return toExitError(err)
-			}
-			for _, k := range ageKeys {
-				rmMasterKeys = append(rmMasterKeys, k)
-			}
-
-			output, err = rotate(rotateOpts{
-				OutputStore:      outputStore,
-				InputStore:       inputStore,
-				InputPath:        fileName,
-				Cipher:           aes.NewCipher(),
-				KeyServices:      svcs,
-				DecryptionOrder:  order,
-				IgnoreMAC:        c.Bool("ignore-mac"),
-				AddMasterKeys:    addMasterKeys,
-				RemoveMasterKeys: rmMasterKeys,
-			})
+			output, err = rotate(rotateOpts)
 			// While this check is also done below, the `err` in this scope shadows
 			// the `err` in the outer scope
 			if err != nil {
@@ -1022,7 +1822,7 @@ func main() {
 			}
 		}
 
-		if c.String("set") != "" {
+		if isSetMode {
 			var path []interface{}
 			var value interface{}
 			path, value, err = extractSetArguments(c.String("set"))
@@ -1042,7 +1842,6 @@ func main() {
 			})
 		}
 
-		isEditMode := !c.Bool("encrypt") && !c.Bool("decrypt") && !c.Bool("rotate") && c.String("set") == ""
 		if isEditMode {
 			_, statErr := os.Stat(fileName)
 			fileExists := statErr == nil
@@ -1060,26 +1859,19 @@ func main() {
 				output, err = edit(opts)
 			} else {
 				// File doesn't exist, edit the example file instead
-				var groups []sops.KeyGroup
-				groups, err = keyGroups(c, fileNameOverride)
-				if err != nil {
-					return toExitError(err)
-				}
-				var threshold int
-				threshold, err = shamirThreshold(c, fileNameOverride)
+				encConfig, err := getEncryptConfig(c, fileNameOverride)
 				if err != nil {
 					return toExitError(err)
 				}
 				output, err = editExample(editExampleOpts{
-					editOpts:          opts,
-					UnencryptedSuffix: unencryptedSuffix,
-					EncryptedSuffix:   encryptedSuffix,
-					UnencryptedRegex:  unencryptedRegex,
-					EncryptedRegex:    encryptedRegex,
-					MACOnlyEncrypted:  macOnlyEncrypted,
-					KeyGroups:         groups,
-					GroupThreshold:    threshold,
+					editOpts:      opts,
+					encryptConfig: encConfig,
 				})
+				// While this check is also done below, the `err` in this scope shadows
+				// the `err` in the outer scope
+				if err != nil {
+					return toExitError(err)
+				}
 			}
 		}
 
@@ -1089,7 +1881,7 @@ func main() {
 
 		// We open the file *after* the operations on the tree have been
 		// executed to avoid truncating it when there's errors
-		if c.Bool("in-place") || isEditMode || c.String("set") != "" {
+		if c.Bool("in-place") || isEditMode || isSetMode {
 			file, err := os.Create(fileName)
 			if err != nil {
 				return common.NewExitError(fmt.Sprintf("Could not open in-place file for writing: %s", err), codes.CouldNotWriteOutputFile)
@@ -1119,6 +1911,155 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+}
+
+func getEncryptConfig(c *cli.Context, fileName string) (encryptConfig, error) {
+	unencryptedSuffix := c.String("unencrypted-suffix")
+	encryptedSuffix := c.String("encrypted-suffix")
+	encryptedRegex := c.String("encrypted-regex")
+	unencryptedRegex := c.String("unencrypted-regex")
+	encryptedCommentRegex := c.String("encrypted-comment-regex")
+	unencryptedCommentRegex := c.String("unencrypted-comment-regex")
+	macOnlyEncrypted := c.Bool("mac-only-encrypted")
+	conf, err := loadConfig(c, fileName, nil)
+	if err != nil {
+		return encryptConfig{}, toExitError(err)
+	}
+	if conf != nil {
+		// command line options have precedence
+		if unencryptedSuffix == "" {
+			unencryptedSuffix = conf.UnencryptedSuffix
+		}
+		if encryptedSuffix == "" {
+			encryptedSuffix = conf.EncryptedSuffix
+		}
+		if encryptedRegex == "" {
+			encryptedRegex = conf.EncryptedRegex
+		}
+		if unencryptedRegex == "" {
+			unencryptedRegex = conf.UnencryptedRegex
+		}
+		if encryptedCommentRegex == "" {
+			encryptedCommentRegex = conf.EncryptedCommentRegex
+		}
+		if unencryptedCommentRegex == "" {
+			unencryptedCommentRegex = conf.UnencryptedCommentRegex
+		}
+		if !macOnlyEncrypted {
+			macOnlyEncrypted = conf.MACOnlyEncrypted
+		}
+	}
+
+	cryptRuleCount := 0
+	if unencryptedSuffix != "" {
+		cryptRuleCount++
+	}
+	if encryptedSuffix != "" {
+		cryptRuleCount++
+	}
+	if encryptedRegex != "" {
+		cryptRuleCount++
+	}
+	if unencryptedRegex != "" {
+		cryptRuleCount++
+	}
+	if encryptedCommentRegex != "" {
+		cryptRuleCount++
+	}
+	if unencryptedCommentRegex != "" {
+		cryptRuleCount++
+	}
+
+	if cryptRuleCount > 1 {
+		return encryptConfig{}, common.NewExitError("Error: cannot use more than one of encrypted_suffix, unencrypted_suffix, encrypted_regex, unencrypted_regex, encrypted_comment_regex, or unencrypted_comment_regex in the same file", codes.ErrorConflictingParameters)
+	}
+
+	// only supply the default UnencryptedSuffix when EncryptedSuffix, EncryptedRegex, and others are not provided
+	if cryptRuleCount == 0 {
+		unencryptedSuffix = sops.DefaultUnencryptedSuffix
+	}
+
+	var groups []sops.KeyGroup
+	groups, err = keyGroups(c, fileName)
+	if err != nil {
+		return encryptConfig{}, err
+	}
+
+	var threshold int
+	threshold, err = shamirThreshold(c, fileName)
+	if err != nil {
+		return encryptConfig{}, err
+	}
+
+	return encryptConfig{
+		UnencryptedSuffix:       unencryptedSuffix,
+		EncryptedSuffix:         encryptedSuffix,
+		UnencryptedRegex:        unencryptedRegex,
+		EncryptedRegex:          encryptedRegex,
+		UnencryptedCommentRegex: unencryptedCommentRegex,
+		EncryptedCommentRegex:   encryptedCommentRegex,
+		MACOnlyEncrypted:        macOnlyEncrypted,
+		KeyGroups:               groups,
+		GroupThreshold:          threshold,
+	}, nil
+}
+
+func getMasterKeys(c *cli.Context, kmsEncryptionContext map[string]*string, kmsOptionName string, pgpOptionName string, gcpKmsOptionName string, azureKvOptionName string, hcVaultTransitOptionName string, ageOptionName string) ([]keys.MasterKey, error) {
+	var masterKeys []keys.MasterKey
+	for _, k := range kms.MasterKeysFromArnString(c.String(kmsOptionName), kmsEncryptionContext, c.String("aws-profile")) {
+		masterKeys = append(masterKeys, k)
+	}
+	for _, k := range pgp.MasterKeysFromFingerprintString(c.String(pgpOptionName)) {
+		masterKeys = append(masterKeys, k)
+	}
+	for _, k := range gcpkms.MasterKeysFromResourceIDString(c.String(gcpKmsOptionName)) {
+		masterKeys = append(masterKeys, k)
+	}
+	azureKeys, err := azkv.MasterKeysFromURLs(c.String(azureKvOptionName))
+	if err != nil {
+		return nil, err
+	}
+	for _, k := range azureKeys {
+		masterKeys = append(masterKeys, k)
+	}
+	hcVaultKeys, err := hcvault.NewMasterKeysFromURIs(c.String(hcVaultTransitOptionName))
+	if err != nil {
+		return nil, err
+	}
+	for _, k := range hcVaultKeys {
+		masterKeys = append(masterKeys, k)
+	}
+	ageKeys, err := age.MasterKeysFromRecipients(c.String(ageOptionName))
+	if err != nil {
+		return nil, err
+	}
+	for _, k := range ageKeys {
+		masterKeys = append(masterKeys, k)
+	}
+	return masterKeys, nil
+}
+
+func getRotateOpts(c *cli.Context, fileName string, inputStore common.Store, outputStore common.Store, svcs []keyservice.KeyServiceClient, decryptionOrder []string) (rotateOpts, error) {
+	kmsEncryptionContext := kms.ParseKMSContext(c.String("encryption-context"))
+	addMasterKeys, err := getMasterKeys(c, kmsEncryptionContext, "add-kms", "add-pgp", "add-gcp-kms", "add-azure-kv", "add-hc-vault-transit", "add-age")
+	if err != nil {
+		return rotateOpts{}, err
+	}
+	rmMasterKeys, err := getMasterKeys(c, kmsEncryptionContext, "rm-kms", "rm-pgp", "rm-gcp-kms", "rm-azure-kv", "rm-hc-vault-transit", "rm-age")
+	if err != nil {
+		return rotateOpts{}, err
+	}
+	return rotateOpts{
+		OutputStore:      outputStore,
+		InputStore:       inputStore,
+		InputPath:        fileName,
+		Cipher:           aes.NewCipher(),
+		KeyServices:      svcs,
+		DecryptionOrder:  decryptionOrder,
+		IgnoreMAC:        c.Bool("ignore-mac"),
+		AddMasterKeys:    addMasterKeys,
+		RemoveMasterKeys: rmMasterKeys,
+	}, nil
 }
 
 func toExitError(err error) error {
@@ -1170,10 +2111,8 @@ func keyservices(c *cli.Context) (svcs []keyservice.KeyServiceClient) {
 }
 
 func loadStoresConfig(context *cli.Context, path string) (*config.StoresConfig, error) {
-	var configPath string
-	if context.String("config") != "" {
-		configPath = context.String("config")
-	} else {
+	configPath := context.GlobalString("config")
+	if configPath == "" {
 		// Ignore config not found errors returned from FindConfigFile since the config file is not mandatory
 		foundPath, err := config.FindConfigFile(".")
 		if err != nil {
@@ -1184,13 +2123,19 @@ func loadStoresConfig(context *cli.Context, path string) (*config.StoresConfig, 
 	return config.LoadStoresConfig(configPath)
 }
 
-func inputStore(context *cli.Context, path string) common.Store {
-	storesConf, _ := loadStoresConfig(context, path)
-	return common.DefaultStoreForPathOrFormat(storesConf, path, context.String("input-type"))
+func inputStore(context *cli.Context, path string) (common.Store, error) {
+	storesConf, err := loadStoresConfig(context, path)
+	if err != nil {
+		return nil, err
+	}
+	return common.DefaultStoreForPathOrFormat(storesConf, path, context.String("input-type")), nil
 }
 
-func outputStore(context *cli.Context, path string) common.Store {
-	storesConf, _ := loadStoresConfig(context, path)
+func outputStore(context *cli.Context, path string) (common.Store, error) {
+	storesConf, err := loadStoresConfig(context, path)
+	if err != nil {
+		return nil, err
+	}
 	if context.IsSet("indent") {
 		indent := context.Int("indent")
 		storesConf.YAML.Indent = indent
@@ -1198,7 +2143,7 @@ func outputStore(context *cli.Context, path string) common.Store {
 		storesConf.JSONBinary.Indent = indent
 	}
 
-	return common.DefaultStoreForPathOrFormat(storesConf, path, context.String("output-type"))
+	return common.DefaultStoreForPathOrFormat(storesConf, path, context.String("output-type")), nil
 }
 
 func parseTreePath(arg string) ([]interface{}, error) {
@@ -1285,7 +2230,7 @@ func keyGroups(c *cli.Context, file string) ([]sops.KeyGroup, error) {
 		conf, err := loadConfig(c, file, kmsEncryptionContext)
 		// config file might just not be supplied, without any error
 		if conf == nil {
-			errMsg := "config file not found and no keys provided through command line options"
+			errMsg := "config file not found, or has no creation rules, and no keys provided through command line options"
 			if err != nil {
 				errMsg = fmt.Sprintf("%s: %s", errMsg, err)
 			}
@@ -1308,10 +2253,8 @@ func keyGroups(c *cli.Context, file string) ([]sops.KeyGroup, error) {
 // Since a config file is not required, this function does not error when one is not found, and instead returns a nil config pointer
 func loadConfig(c *cli.Context, file string, kmsEncryptionContext map[string]*string) (*config.Config, error) {
 	var err error
-	var configPath string
-	if c.String("config") != "" {
-		configPath = c.String("config")
-	} else {
+	configPath := c.GlobalString("config")
+	if configPath == "" {
 		// Ignore config not found errors returned from FindConfigFile since the config file is not mandatory
 		configPath, err = config.FindConfigFile(".")
 		if err != nil {
@@ -1333,7 +2276,7 @@ func shamirThreshold(c *cli.Context, file string) (int, error) {
 	conf, err := loadConfig(c, file, nil)
 	if conf == nil {
 		// This takes care of the following two case:
-		// 1. No config was provided. Err will be nil and ShamirThreshold will be the default value of 0.
+		// 1. No config was provided, or contains no creation rules. Err will be nil and ShamirThreshold will be the default value of 0.
 		// 2. We did find a config file, but failed to load it. In that case the calling function will print the error and exit.
 		return 0, err
 	}

@@ -96,12 +96,12 @@ separated, in the **SOPS_PGP_FP** env variable.
 
 Note: you can use both PGP and KMS simultaneously.
 
-Then simply call ``sops`` with a file path as argument. It will handle the
+Then simply call ``sops edit`` with a file path as argument. It will handle the
 encryption/decryption transparently and open the cleartext file in an editor
 
 .. code:: sh
 
-    $ sops mynewtestfile.yaml
+    $ sops edit mynewtestfile.yaml
     mynewtestfile.yaml doesn't exist, creating it.
     please wait while an encryption key is being generated and stored in a secure fashion
     file written to mynewtestfile.yaml
@@ -154,7 +154,7 @@ To decrypt a file in a ``cat`` fashion, use the ``-d`` flag:
 
 .. code:: sh
 
-    $ sops -d mynewtestfile.yaml
+    $ sops decrypt mynewtestfile.yaml
 
 SOPS encrypted files contain the necessary information to decrypt their content.
 All a user of SOPS needs is valid AWS credentials and the necessary
@@ -164,7 +164,7 @@ Given that, the only command a SOPS user needs is:
 
 .. code:: sh
 
-    $ sops <file>
+    $ sops edit <file>
 
 `<file>` will be opened, decrypted, passed to a text editor (vim by default),
 encrypted if modified, and saved back to its original location. All of these
@@ -184,7 +184,7 @@ the example files and pgp key provided with the repository::
     $ git clone https://github.com/getsops/sops.git
     $ cd sops
     $ gpg --import pgp/sops_functional_tests_key.asc
-    $ sops example.yaml
+    $ sops edit example.yaml
 
 This last step will decrypt ``example.yaml`` using the test private key.
 
@@ -200,11 +200,12 @@ the ``--age`` option or the **SOPS_AGE_RECIPIENTS** environment variable:
 
 .. code:: sh
 
-    $ sops --encrypt --age age1yt3tfqlfrwdwx0z0ynwplcr6qxcxfaqycuprpmy89nr83ltx74tqdpszlw test.yaml > test.enc.yaml
+    $ sops encrypt --age age1yt3tfqlfrwdwx0z0ynwplcr6qxcxfaqycuprpmy89nr83ltx74tqdpszlw test.yaml > test.enc.yaml
 
 When decrypting a file with the corresponding identity, SOPS will look for a
 text file name ``keys.txt`` located in a ``sops`` subdirectory of your user
 configuration directory. On Linux, this would be ``$XDG_CONFIG_HOME/sops/age/keys.txt``.
+If ``$XDG_CONFIG_HOME`` is not set ``$HOME/.config/sops/age/keys.txt`` is used instead.
 On macOS, this would be ``$HOME/Library/Application Support/sops/age/keys.txt``. On
 Windows, this would be ``%AppData%\sops\age\keys.txt``. You can specify the location
 of this file manually by setting the environment variable **SOPS_AGE_KEY_FILE**.
@@ -217,7 +218,28 @@ identity will be tried in sequence until one is able to decrypt the data.
 
 Encrypting with SSH keys via age is not yet supported by SOPS.
 
+A list of age recipients can be added to the ``.sops.yaml``:
 
+.. code:: yaml
+
+    creation_rules:
+        - age: >-
+            age1s3cqcks5genc6ru8chl0hkkd04zmxvczsvdxq99ekffe4gmvjpzsedk23c,
+            age1qe5lxzzeppw5k79vxn3872272sgy224g2nzqlzy3uljs84say3yqgvd0sw
+
+It is also possible to use ``updatekeys``, when adding or removing age recipients. For example:
+
+.. code:: sh
+
+  $ sops updatekeys secret.enc.yaml
+  2022/02/09 16:32:02 Syncing keys for file /iac/solution1/secret.enc.yaml
+  The following changes will be made to the file's groups:
+  Group 1
+      age1s3cqcks5genc6ru8chl0hkkd04zmxvczsvdxq99ekffe4gmvjpzsedk23c
+  +++ age1qe5lxzzeppw5k79vxn3872272sgy224g2nzqlzy3uljs84say3yqgvd0sw
+  Is this okay? (y/n):y
+  2022/02/09 16:32:04 File /iac/solution1/secret.enc.yaml synced with new keys
+  
 Encrypting using GCP KMS
 ~~~~~~~~~~~~~~~~~~~~~~~~
 GCP KMS uses `Application Default Credentials
@@ -250,11 +272,11 @@ sdk:
 
 Now you can encrypt a file using::
 
-    $ sops --encrypt --gcp-kms projects/my-project/locations/global/keyRings/sops/cryptoKeys/sops-key test.yaml > test.enc.yaml
+    $ sops encrypt --gcp-kms projects/my-project/locations/global/keyRings/sops/cryptoKeys/sops-key test.yaml > test.enc.yaml
 
 And decrypt it using::
 
-     $ sops --decrypt test.enc.yaml
+     $ sops decrypt test.enc.yaml
 
 Encrypting using Azure Key Vault
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -324,11 +346,11 @@ from the commandline:
 
 Now you can encrypt a file using::
 
-    $ sops --encrypt --azure-kv https://sops.vault.azure.net/keys/sops-key/some-string test.yaml > test.enc.yaml
+    $ sops encrypt --azure-kv https://sops.vault.azure.net/keys/sops-key/some-string test.yaml > test.enc.yaml
 
 And decrypt it using::
 
-    $ sops --decrypt test.enc.yaml
+    $ sops decrypt test.enc.yaml
 
 
 Encrypting and decrypting from other programs
@@ -344,7 +366,7 @@ To decrypt data, you can simply do:
 
 .. code:: sh
 
-	$ cat encrypted-data | sops --decrypt /dev/stdin > decrypted-data
+	$ cat encrypted-data | sops decrypt /dev/stdin > decrypted-data
 
 To control the input and output format, pass ``--input-type`` and ``--output-type`` as appropriate. By default,
 ``sops`` determines the input and output format from the provided filename, which is ``/dev/stdin`` here, and
@@ -354,7 +376,7 @@ For example, to decrypt YAML data and obtain the decrypted result as YAML, use:
 
 .. code:: sh
 
-	$ cat encrypted-data | sops --input-type yaml --output-type yaml --decrypt /dev/stdin > decrypted-data
+	$ cat encrypted-data | sops decrypt --input-type yaml --output-type yaml /dev/stdin > decrypted-data
 
 To encrypt, it is important to note that SOPS also uses the filename to look up the correct creation rule from
 ``.sops.yaml``. Likely ``/dev/stdin`` will not match a creation rule, or only match the fallback rule without
@@ -363,7 +385,7 @@ parameter which allows you to tell SOPS which filename to use to match creation 
 
 .. code:: sh
 
-	$ echo 'foo: bar' | sops --filename-override path/filename.sops.yaml --encrypt /dev/stdin > encrypted-data
+	$ echo 'foo: bar' | sops encrypt --filename-override path/filename.sops.yaml /dev/stdin > encrypted-data
 
 SOPS will find a matching creation rule for ``path/filename.sops.yaml`` in ``.sops.yaml`` and use that one to
 encrypt the data from stdin. This filename will also be used to determine the input and output store. As always,
@@ -372,7 +394,7 @@ the input store type can be adjusted by passing ``--input-type``, and the output
 
 .. code:: sh
 
-	$ echo foo=bar | sops --filename-override path/filename.sops.yaml --input-type dotenv --encrypt /dev/stdin > encrypted-data
+	$ echo foo=bar | sops encrypt --filename-override path/filename.sops.yaml --input-type dotenv /dev/stdin > encrypted-data
 
 
 Encrypting using Hashicorp Vault
@@ -423,7 +445,7 @@ To easily deploy Vault locally: (DO NOT DO THIS FOR PRODUCTION!!!)
     $ vault write sops/keys/thirdkey type=chacha20-poly1305
     Success! Data written to: sops/keys/thirdkey
 
-    $ sops --encrypt --hc-vault-transit $VAULT_ADDR/v1/sops/keys/firstkey vault_example.yml
+    $ sops encrypt --hc-vault-transit $VAULT_ADDR/v1/sops/keys/firstkey vault_example.yml
 
     $ cat <<EOF > .sops.yaml
     creation_rules:
@@ -433,7 +455,7 @@ To easily deploy Vault locally: (DO NOT DO THIS FOR PRODUCTION!!!)
           hc_vault_transit_uri: "$VAULT_ADDR/v1/sops/keys/thirdkey"
     EOF
 
-    $ sops --verbose -e prod/raw.yaml > prod/encrypted.yaml
+    $ sops encrypt --verbose prod/raw.yaml > prod/encrypted.yaml
 
 Adding and removing keys
 ~~~~~~~~~~~~~~~~~~~~~~~~
@@ -480,35 +502,33 @@ separated list.
 SOPS will prompt you with the changes to be made. This interactivity can be
 disabled by supplying the ``-y`` flag.
 
-Command Line
-************
+``rotate`` command
+******************
 
-Command line flag ``--add-kms``, ``--add-pgp``, ``--add-gcp-kms``, ``--add-azure-kv``,
-``--rm-kms``, ``--rm-pgp``, ``--rm-gcp-kms`` and ``--rm-azure-kv`` can be used to add
-and remove keys from a file.
-These flags use the comma separated syntax as the ``--kms``, ``--pgp``, ``--gcp-kms``
-and ``--azure-kv`` arguments when creating new files.
+The ``rotate`` command generates a new data encryption key and reencrypt all values
+with the new key. At te same time, the command line flag ``--add-kms``, ``--add-pgp``,
+``--add-gcp-kms``, ``--add-azure-kv``, ``--rm-kms``, ``--rm-pgp``, ``--rm-gcp-kms``
+and ``--rm-azure-kv`` can be used to add and remove keys from a file. These flags use
+the comma separated syntax as the ``--kms``, ``--pgp``, ``--gcp-kms`` and ``--azure-kv``
+arguments when creating new files.
 
-Note that ``-r`` or ``--rotate`` is mandatory in this mode. Not specifying
-rotate will ignore the ``--add-*`` options. Use ``updatekeys`` if you want to
-add a key without rotating the data key.
+Use ``updatekeys`` if you want to add a key without rotating the data key.
 
 .. code:: sh
 
     # add a new pgp key to the file and rotate the data key
-    $ sops -r -i --add-pgp 85D77543B3D624B63CEA9E6DBC17301B491B3F21 example.yaml
+    $ sops rotate -i --add-pgp 85D77543B3D624B63CEA9E6DBC17301B491B3F21 example.yaml
 
     # remove a pgp key from the file and rotate the data key
-    $ sops -r -i --rm-pgp 85D77543B3D624B63CEA9E6DBC17301B491B3F21 example.yaml
+    $ sops rotate -i --rm-pgp 85D77543B3D624B63CEA9E6DBC17301B491B3F21 example.yaml
 
 
 Direct Editing
 **************
 
-Alternatively, invoking ``sops`` with the flag **-s** will display the master keys
+Alternatively, invoking ``sops edit`` with the flag **-s** will display the master keys
 while editing. This method can be used to add or remove ``kms`` or ``pgp`` keys under the
-``sops`` section. Invoking ``sops`` with the **-i** flag will perform an in-place edit
-instead of redirecting output to ``stdout``.
+``sops`` section.
 
 For example, to add a KMS master key to a file, add the following entry while
 editing:
@@ -620,7 +640,7 @@ When creating a new file, you can specify the encryption context in the
 
 .. code:: sh
 
-    $ sops --encryption-context Environment:production,Role:web-server test.dev.yaml
+    $ sops edit --encryption-context Environment:production,Role:web-server test.dev.yaml
 
 The format of the Encrypt Context string is ``<EncryptionContext Key>:<EncryptionContext Value>,<EncryptionContext Key>:<EncryptionContext Value>,...``
 
@@ -651,13 +671,16 @@ Key Rotation
 ~~~~~~~~~~~~
 
 It is recommended to renew the data key on a regular basis. ``sops`` supports key
-rotation via the ``-r`` flag. Invoking it on an existing file causes ``sops`` to
-reencrypt the file with a new data key, which is then encrypted with the various
+rotation via the ``rotate`` command. Invoking it on an existing file causes ``sops``
+to reencrypt the file with a new data key, which is then encrypted with the various
 KMS and PGP master keys defined in the file.
+
+Add the ``-i`` option to write the rotated file back, instead of printing it to
+stdout.
 
 .. code:: sh
 
-    $ sops -r example.yaml
+    $ sops rotate example.yaml
 
 Using .sops.yaml conf to select KMS, PGP and age for new files
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -666,6 +689,11 @@ It is often tedious to specify the ``--kms`` ``--gcp-kms`` ``--pgp`` and ``--age
 of all new files. If your secrets are stored under a specific directory, like a
 ``git`` repository, you can create a ``.sops.yaml`` configuration file at the root
 directory to define which keys are used for which filename.
+
+.. note::
+
+  The file needs to be named ``.sops.yaml``. Other names (i.e. ``.sops.yml``) won't be automatically
+  discovered by SOPS. You'll need to pass the ``--config .sops.yml`` option for it to be picked up.
 
 Let's take an example:
 
@@ -741,7 +769,7 @@ Creating a new file with the right keys is now as simple as
 
 .. code:: sh
 
-    $ sops <newfile>.prod.yaml
+    $ sops edit <newfile>.prod.yaml
 
 Note that the configuration file is ignored when KMS or PGP parameters are
 passed on the SOPS command line or in environment variables.
@@ -847,7 +875,7 @@ For example:
 
 .. code:: sh
 
-    $ sops --shamir-secret-sharing-threshold 2 example.json
+    $ sops edit --shamir-secret-sharing-threshold 2 example.json
 
 Alternatively, you can configure the Shamir threshold for each creation rule in the ``.sops.yaml`` config
 with ``shamir_threshold``:
@@ -880,7 +908,7 @@ with ``shamir_threshold``:
               - pgp:
                     - fingerprint5
 
-And then run ``sops example.json``.
+And then run ``sops edit example.json``.
 
 The threshold (``shamir_threshold``) is set to 2, so this configuration will require
 master keys from two of the three different key groups in order to decrypt the file.
@@ -888,7 +916,7 @@ You can then decrypt the file the same way as with any other SOPS file:
 
 .. code:: sh
 
-    $ sops -d example.json
+    $ sops decrypt example.json
 
 Key service
 ~~~~~~~~~~~
@@ -928,14 +956,14 @@ service exposed on the unix socket located in ``/tmp/sops.sock``, you can run:
 
 .. code:: sh
 
-    $ sops --keyservice unix:///tmp/sops.sock -d file.yaml`
+    $ sops decrypt --keyservice unix:///tmp/sops.sock file.yaml`
 
 And if you only want to use the key service exposed on the unix socket located
 in ``/tmp/sops.sock`` and not the local key service, you can run:
 
 .. code:: sh
 
-    $ sops --enable-local-keyservice=false --keyservice unix:///tmp/sops.sock -d file.yaml
+    $ sops decrypt --enable-local-keyservice=false --keyservice unix:///tmp/sops.sock file.yaml
 
 Auditing
 ~~~~~~~~
@@ -1002,7 +1030,7 @@ written to disk.
 .. code:: sh
 
     # print secrets to stdout to confirm values
-    $ sops -d out.json
+    $ sops decrypt out.json
     {
             "database_password": "jf48t9wfw094gf4nhdf023r",
             "AWS_ACCESS_KEY_ID": "AKIAIOSFODNN7EXAMPLE",
@@ -1152,7 +1180,7 @@ Below is an example of publishing to Vault (using token auth with a local dev in
 
     $ export VAULT_TOKEN=...
     $ export VAULT_ADDR='http://127.0.0.1:8200'
-    $ sops -d vault/test.yaml
+    $ sops decrypt vault/test.yaml
     example_string: bar
     example_number: 42
     example_map:
@@ -1193,23 +1221,23 @@ extension after encrypting a file. For example:
 
 .. code:: sh
 
-    $ sops -e -i myfile.json
-    $ sops -d myfile.json
+    $ sops encrypt -i myfile.json
+    $ sops decrypt myfile.json
 
 If you want to change the extension of the file once encrypted, you need to provide
 ``sops`` with the ``--input-type`` flag upon decryption. For example:
 
 .. code:: sh
 
-    $ sops -e myfile.json > myfile.json.enc
+    $ sops encrypt myfile.json > myfile.json.enc
 
-    $ sops -d --input-type json myfile.json.enc
+    $ sops decrypt --input-type json myfile.json.enc
 
 When operating on stdin, use the ``--input-type`` and ``--output-type`` flags as follows:
 
 .. code:: sh
 
-    $ cat myfile.json | sops --input-type json --output-type json -d /dev/stdin
+    $ cat myfile.json | sops decrypt --input-type json --output-type json /dev/stdin
 
 JSON and JSON_binary indentation
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1348,7 +1376,7 @@ The command below creates a new file with a data key encrypted by KMS and PGP.
 
 .. code:: sh
 
-    $ sops --kms "arn:aws:kms:us-west-2:927034868273:key/fe86dd69-4132-404c-ab86-4269956b4500" --pgp C9CAB0AF1165060DB58D6D6B2653B624D620786D /path/to/new/file.yaml
+    $ sops edit --kms "arn:aws:kms:us-west-2:927034868273:key/fe86dd69-4132-404c-ab86-4269956b4500" --pgp C9CAB0AF1165060DB58D6D6B2653B624D620786D /path/to/new/file.yaml
 
 Encrypting an existing file
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1361,13 +1389,13 @@ encrypt the file, and redirect the output to a destination file.
 
     $ export SOPS_KMS_ARN="arn:aws:kms:us-west-2:927034868273:key/fe86dd69-4132-404c-ab86-4269956b4500"
     $ export SOPS_PGP_FP="C9CAB0AF1165060DB58D6D6B2653B624D620786D"
-    $ sops -e /path/to/existing/file.yaml > /path/to/new/encrypted/file.yaml
+    $ sops encrypt /path/to/existing/file.yaml > /path/to/new/encrypted/file.yaml
 
 Decrypt the file with ``-d``.
 
 .. code:: sh
 
-    $ sops -d /path/to/new/encrypted/file.yaml
+    $ sops decrypt /path/to/new/encrypted/file.yaml
 
 Encrypt or decrypt a file in place
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1378,9 +1406,9 @@ original file after encrypting or decrypting it.
 .. code:: sh
 
     # file.yaml is in cleartext
-    $ sops -e -i /path/to/existing/file.yaml
+    $ sops encrypt -i /path/to/existing/file.yaml
     # file.yaml is now encrypted
-    $ sops -d -i /path/to/existing/file.yaml
+    $ sops decrypt -i /path/to/existing/file.yaml
     # file.yaml is back in cleartext
 
 Encrypting binary files
@@ -1407,10 +1435,10 @@ In-place encryption/decryption also works on binary files.
     $ sha512sum /tmp/somerandom
     9589bb20280e9d381f7a192000498c994e921b3cdb11d2ef5a986578dc2239a340b25ef30691bac72bdb14028270828dad7e8bd31e274af9828c40d216e60cbe /tmp/somerandom
 
-    $ sops -e -i /tmp/somerandom
+    $ sops encrypt -i /tmp/somerandom
     please wait while a data encryption key is being generated and stored securely
 
-    $ sops -d -i /tmp/somerandom
+    $ sops decrypt -i /tmp/somerandom
 
     $ sha512sum /tmp/somerandom
     9589bb20280e9d381f7a192000498c994e921b3cdb11d2ef5a986578dc2239a340b25ef30691bac72bdb14028270828dad7e8bd31e274af9828c40d216e60cbe /tmp/somerandom
@@ -1424,7 +1452,7 @@ values, like keys, without needing an extra parser.
 
 .. code:: sh
 
-    $ sops -d --extract '["app2"]["key"]' ~/git/svc/sops/example.yaml
+    $ sops decrypt --extract '["app2"]["key"]' ~/git/svc/sops/example.yaml
     -----BEGIN RSA PRIVATE KEY-----
     MIIBPAIBAAJBAPTMNIyHuZtpLYc7VsHQtwOkWYobkUblmHWRmbXzlAX6K8tMf3Wf
     ImcbNkqAKnELzFAPSBeEMhrBN0PyOC9lYlMCAwEAAQJBALXD4sjuBn1E7Y9aGiMz
@@ -1441,19 +1469,19 @@ them.
 
 .. code:: sh
 
-    $ sops -d --extract '["an_array"][1]' ~/git/svc/sops/example.yaml
+    $ sops decrypt --extract '["an_array"][1]' ~/git/svc/sops/example.yaml
     secretuser2
 
 Set a sub-part in a document tree
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 SOPS can set a specific part of a YAML or JSON document, by providing
-the path and value in the ``--set`` command line flag. This is useful to
-set specific values, like keys, without needing an editor.
+the path and value in the ``set`` command. This is useful to set specific
+values, like keys, without needing an editor.
 
 .. code:: sh
 
-    $ sops --set '["app2"]["key"] "app2keystringvalue"'  ~/git/svc/sops/example.yaml
+    $ sops set ~/git/svc/sops/example.yaml '["app2"]["key"]' '"app2keystringvalue"'
 
 The tree path syntax uses regular python dictionary syntax, without the
 variable name. Set to keys by naming them, and array elements by
@@ -1461,13 +1489,32 @@ numbering them.
 
 .. code:: sh
 
-    $ sops --set '["an_array"][1] "secretuser2"' ~/git/svc/sops/example.yaml
+    $ sops set ~/git/svc/sops/example.yaml '["an_array"][1]' '"secretuser2"'
 
 The value must be formatted as json.
 
 .. code:: sh
 
-    $ sops --set '["an_array"][1] {"uid1":null,"uid2":1000,"uid3":["bob"]}' ~/git/svc/sops/example.yaml
+    $ sops set ~/git/svc/sops/example.yaml '["an_array"][1]' '{"uid1":null,"uid2":1000,"uid3":["bob"]}'
+
+Unset a sub-part in a document tree
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Symmetrically, SOPS can unset a specific part of a YAML or JSON document, by providing
+the path in the ``unset`` command. This is useful to unset specific values, like keys, without
+needing an editor.
+
+.. code:: sh
+
+    $ sops unset ~/git/svc/sops/example.yaml '["app2"]["key"]'
+
+The tree path syntax uses regular python dictionary syntax, without the
+variable name. Set to keys by naming them, and array elements by
+numbering them.
+
+.. code:: sh
+
+    $ sops unset ~/git/svc/sops/example.yaml '["an_array"][1]'
 
 Showing diffs in cleartext in git
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1488,11 +1535,11 @@ to a SOPS command in the git configuration file of the repository.
 
 .. code:: sh
 
-    $ git config diff.sopsdiffer.textconv "sops -d"
+    $ git config diff.sopsdiffer.textconv "sops decrypt"
 
     $ grep -A 1 sopsdiffer .git/config
     [diff "sopsdiffer"]
-        textconv = "sops -d"
+        textconv = "sops decrypt"
 
 With this in place, calls to ``git diff`` will decrypt both previous and current
 versions of the target file prior to displaying the diff. And it even works with
@@ -1527,7 +1574,7 @@ keys that match the supplied regular expression.  For example, this command:
 
 .. code:: sh
 
-    $ sops --encrypt --encrypted-regex '^(data|stringData)$' k8s-secrets.yaml
+    $ sops encrypt --encrypted-regex '^(data|stringData)$' k8s-secrets.yaml
 
 will encrypt the values under the ``data`` and ``stringData`` keys in a YAML file
 containing kubernetes secrets.  It will not encrypt other values that help you to
@@ -1539,14 +1586,24 @@ that match the supplied regular expression. For example, this command:
 
 .. code:: sh
 
-    $ sops --encrypt --unencrypted-regex '^(description|metadata)$' k8s-secrets.yaml
+    $ sops encrypt --unencrypted-regex '^(description|metadata)$' k8s-secrets.yaml
 
 will not encrypt the values under the ``description`` and ``metadata`` keys in a YAML file
 containing kubernetes secrets, while encrypting everything else.
 
+For YAML files, another method is to use ``--encrypted-comment-regex`` which will
+only encrypt comments and values which have a preceding comment matching the supplied
+regular expression.
+
+Conversely, you can opt in to only left certain keys without encrypting by using the
+``--unencrypted-comment-regex`` option, which will leave the values and comments
+unencrypted when they have a preeceding comment, or a trailing comment on the same line,
+that matches the supplied regular expression.
+
 You can also specify these options in the ``.sops.yaml`` config file.
 
-Note: these four options ``--unencrypted-suffix``, ``--encrypted-suffix``, ``--encrypted-regex`` and ``--unencrypted-regex`` are
+Note: these six options ``--unencrypted-suffix``, ``--encrypted-suffix``, ``--encrypted-regex``,
+``--unencrypted-regex``, ``--encrypted-comment-regex``, and ``--unencrypted-comment-regex`` are
 mutually exclusive and cannot all be used in the same file.
 
 Encryption Protocol
@@ -1742,7 +1799,7 @@ when creating a new file:
 
 .. code:: sh
 
-    $ sops --pgp "E60892BB9BD89A69F759A1A0A3D652173B763E8F,84050F1D61AF7C230A12217687DF65059EF093D3,85D77543B3D624B63CEA9E6DBC17301B491B3F21" mynewfile.yaml
+    $ sops edit --pgp "E60892BB9BD89A69F759A1A0A3D652173B763E8F,84050F1D61AF7C230A12217687DF65059EF093D3,85D77543B3D624B63CEA9E6DBC17301B491B3F21" mynewfile.yaml
 
 Threat Model
 ------------
